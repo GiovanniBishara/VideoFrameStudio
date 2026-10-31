@@ -1,0 +1,25 @@
+{
+  "name": "videoframe-transcript-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Estrazione frame, trascrizione Whisper e compressione video direttamente nel browser (WebCodecs, WebGPU, Web Workers).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "build:single": "node build.mjs --single",
+    "build:test": "node build.mjs --test",
+    "dev": "node build.mjs --serve",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "mediabunny": "1.65.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^6.0.3"
+  }
+}
