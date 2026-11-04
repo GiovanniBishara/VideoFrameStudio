@@ -1,5 +1,6 @@
 // Test unitari (Node): ZIP/ZIP64, ricampionamento, logica di trascrizione a finestre,
-// rilevamento dei cambi di slide, composizione del testo.
+// rilevamento dei cambi di slide, composizione del testo, regole del Whisper originale,
+// nuovi tentativi guidati dalla confidenza e seconda passata sui tratti saltati.
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -7,7 +8,16 @@ import path from 'node:path';
 import { frameFileName, hmsMillis } from '../src/shared/format';
 import { StreamingResampler } from '../src/shared/resample';
 import { ChangeDetector, THUMB_H, THUMB_W } from '../src/shared/smart';
-import { SAMPLE_RATE, planSeek, runTranscription, type AudioFeed } from '../src/shared/transcribeCore';
+import {
+	SAMPLE_RATE,
+	planSeek,
+	runTranscription,
+	type AudioFeed,
+	type RawSegment,
+	type WindowRequest,
+	type WindowResult,
+} from '../src/shared/transcribeCore';
+import { LogprobTracker, MAX_INITIAL_TIMESTAMP_INDEX, applyTimestampRules, logSoftmax } from '../src/shared/whisperRules';
 import { buildSrt, buildTxt } from '../src/shared/transcriptText';
 import { ZipWriter, crc32 } from '../src/shared/zip';
 import { FakeToneEngine } from '../src/test/fakeEngine';
@@ -217,6 +227,115 @@ async function testTranscription() {
 	check(txt.includes('[PARTE NON TRASCRITTA'), 'il buco è scritto nel testo');
 }
 
+function testWhisperRules() {
+	console.log('Regole del Whisper originale');
+	const TS = 50365; // primo token timestamp di Whisper large-v3
+	const V = TS + 1501;
+	const fresh = () => new Float32Array(V).fill(1);
+	let l = fresh();
+	applyTimestampRules([], l, TS);
+	check(
+		l[TS + MAX_INITIAL_TIMESTAMP_INDEX] === 1 && l[TS + MAX_INITIAL_TIMESTAMP_INDEX + 1] === -Infinity && l[V - 1] === -Infinity && l[100] === 1,
+		'primo timestamp entro 1 s (oltre: vietato)',
+	);
+	l = fresh();
+	applyTimestampRules([TS + 10, 400, 401], l, TS);
+	check(l[TS + 10] === -Infinity && l[TS + 11] === 1 && l[TS] === -Infinity && l[400] === 1, 'dopo il testo il timestamp di chiusura deve avanzare');
+	l = fresh();
+	applyTimestampRules([TS + 10, 400, TS + 20], l, TS);
+	check(l[TS + 19] === -Infinity && l[TS + 20] === 1, 'dopo la chiusura il segmento successivo può iniziare allo stesso istante');
+	l = fresh();
+	applyTimestampRules([TS + 10, 400, TS + 20, TS + 20], l, TS);
+	check(l[TS + 20] === -Infinity && l[TS + 21] === 1, 'i tempi non tornano mai indietro');
+
+	const t1 = new LogprobTracker(0);
+	t1.step(null, new Float32Array([0, Math.log(3)]));
+	t1.step(1, new Float32Array([Math.log(9), 0]));
+	t1.finish(0);
+	check(Math.abs((t1.average as number) - (Math.log(0.75) + Math.log(0.9)) / 2) < 1e-6, 'confidenza = media del log-probabilità dei token scelti');
+	const t2 = new LogprobTracker(0.5);
+	t2.step(null, new Float32Array([0, Math.log(3) / 0.5])); // logit divisi per T dal campionamento
+	t2.finish(1);
+	check(Math.abs((t2.average as number) - Math.log(0.75)) < 1e-6, 'con temperatura la confidenza è riportata a T = 1');
+	// stesso risultato del log-softmax completo, su logit realistici con valori vietati (-∞)
+	const big = new Float32Array(51866).map((_, i) => Math.sin(i * 12.9898) * 8);
+	big.fill(-Infinity, 50365 + 51);
+	const tok = [17, 50365, 40000, 50400];
+	const t3 = new LogprobTracker(0);
+	let ref = 0;
+	for (const k of tok) {
+		t3.step(null, big);
+		t3.finish(k);
+		ref += logSoftmax(big)[k];
+	}
+	check(Math.abs((t3.average as number) - ref / tok.length) < 1e-4, 'calcolo per parola alleggerito: stesso valore del log-softmax completo');
+}
+
+/** 3 minuti di frasi a toni, per i test dei nuovi tentativi e della seconda passata. */
+function shortLecture() {
+	const sentences: { id: number; start: number; dur: number }[] = [];
+	let t = 0.6;
+	for (let id = 1; t < 170; id++) {
+		const dur = 2.5 + ((id * 29) % 40) / 10;
+		sentences.push({ id, start: t, dur });
+		t += dur + 0.5 + ((id * 7) % 12) / 10;
+	}
+	return { sentences, audio: makeToneAudio(sentences, t + 3), total: t + 3 };
+}
+
+const quiet = { onSegments() {}, onProgress() {}, onLog() {}, isCancelled: () => false };
+
+async function testRetriesAndRepass() {
+	console.log('Nuovi tentativi e seconda passata');
+	const { sentences, audio, total } = shortLecture();
+	const expected = sentences.map((x) => `frase ${x.id}.`);
+	const run = async (engine: { transcribeWindow(a: Float32Array, r: WindowRequest): Promise<WindowResult | RawSegment[]> }) => {
+		const feed = new ArrayFeed(audio);
+		feed.expectedDuration = total;
+		const base = new FakeToneEngine();
+		return runTranscription(feed, Object.assign(base, { transcribeWindow: engine.transcribeWindow }), 'it', quiet);
+	};
+
+	// A temperatura 0 il modello è insicuro e sbaglia: la finestra va rifatta a temperatura più alta.
+	const truth = new FakeToneEngine();
+	const temps: number[] = [];
+	const r1 = await run({
+		async transcribeWindow(a, req) {
+			temps.push(req.temperature ?? 0);
+			const segs = await truth.transcribeWindow(a, req);
+			if (!req.temperature) return { segments: segs.map((x) => ({ ...x, text: 'testo sbagliato.' })), avgLogprob: -2.3 };
+			return { segments: segs, avgLogprob: -0.2 };
+		},
+	});
+	check(temps.includes(0.2) && !temps.includes(0.4), 'confidenza bassa a temperatura 0 → nuovo tentativo a 0,2');
+	check(JSON.stringify(r1.segments.map((x) => x.text)) === JSON.stringify(expected), 'il testo finale viene dal tentativo sicuro');
+	check(r1.retries > 0 && r1.lowConfidence === 0, `finestre ripetute contate (${r1.retries}), nessuna rimasta incerta`);
+
+	// Sempre insicuro: il testo resta (mai buttato) ma è segnato da ricontrollare.
+	const r2 = await run({
+		async transcribeWindow(a, req) {
+			return { segments: await truth.transcribeWindow(a, req), avgLogprob: -1.7 };
+		},
+	});
+	check(r2.segments.length === expected.length && r2.segments.every((x) => x.flags?.includes('bassa confidenza')), 'testo incerto conservato e segnato "bassa confidenza"');
+	check(r2.lowConfidence === r2.windows, `riepilogo: ${r2.lowConfidence} finestre a bassa confidenza su ${r2.windows}`);
+
+	// Il modello salta una frase in mezzo alla finestra: la seconda passata la recupera.
+	const r3 = await run({
+		async transcribeWindow(a, req) {
+			const segs = await truth.transcribeWindow(a, req);
+			if (a.length < 20 * SAMPLE_RATE || segs.length < 4) return segs;
+			return segs.filter((_, i) => i !== 1); // seconda frase di ogni finestra persa
+		},
+	});
+	const texts3 = r3.segments.map((x) => x.text);
+	check(JSON.stringify(texts3) === JSON.stringify(expected), `frasi saltate recuperate tutte, nell'ordine (${texts3.length}/${expected.length})`);
+	check(r3.recovered > 0 && r3.segments.filter((x) => x.flags?.includes('recuperato nella seconda passata')).length === r3.recovered, `${r3.recovered} segmenti recuperati e segnati come tali`);
+	let maxErr = 0;
+	for (let i = 0; i < Math.min(r3.segments.length, sentences.length); i++) maxErr = Math.max(maxErr, Math.abs(r3.segments[i].start - sentences[i].start));
+	check(maxErr < 0.06, `frasi recuperate con i tempi esatti (errore max ${(maxErr * 1000).toFixed(0)} ms)`);
+}
+
 function testText() {
 	console.log('Testo e SRT');
 	const segs = [
@@ -306,6 +425,8 @@ function testSmart() {
 await testZip();
 testResampler();
 await testTranscription();
+testWhisperRules();
+await testRetriesAndRepass();
 testText();
 testSmart();
 fs.rmSync(tmp, { recursive: true, force: true });

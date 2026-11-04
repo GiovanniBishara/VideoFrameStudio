@@ -10,6 +10,7 @@ import {
 	detectCapabilities,
 	downloadOutput,
 	estimateImageBytes,
+	keepScreenAwake,
 	leftoverBytes,
 	probeVideo,
 } from './app/system';
@@ -38,6 +39,7 @@ interface JobState {
 	complete?: boolean;
 	error?: string;
 }
+type Jobs = Record<JobKey, JobState>;
 interface LogLine {
 	time: string;
 	job: string;
@@ -45,19 +47,59 @@ interface LogLine {
 	message: string;
 }
 
+/** Stato di un video nella coda: "warn" = completato con avvisi. */
+type QueueStatus = 'pending' | 'running' | 'done' | 'warn' | 'error' | 'cancelled';
+interface QueueItem {
+	id: string;
+	file: File;
+	info: VideoInfo | null;
+	probing: boolean;
+	/** Il file non si può leggere: resta nella lista ma non viene elaborato. */
+	error: string | null;
+	h264: { hw: boolean; sw: boolean } | null;
+	frameCount: number | null;
+	status: QueueStatus;
+	/** Risultati dell'ultima elaborazione di questo video. */
+	jobs: Jobs | null;
+}
+
 const JOB_LABEL: Record<JobKey, string> = { frames: 'Frame', transcribe: 'Trascrizione', compress: 'Compressione' };
+const JOB_KEYS: JobKey[] = ['frames', 'transcribe', 'compress'];
 const idleJob = (): JobState => ({ status: 'idle', progress: null, outputs: [] });
+const idleJobs = (): Jobs => ({ frames: idleJob(), transcribe: idleJob(), compress: idleJob() });
+const baseNameOf = (f: File) => f.name.replace(/\.[^.]+$/, '');
+/** Nome di cartella valido su Windows, macOS e Linux. */
+const safeFolderName = (name: string) =>
+	name
+		.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+		.replace(/[. ]+$/, '')
+		.slice(0, 120) || 'video';
 
 function App() {
 	const [caps, setCaps] = useState<Capabilities | null>(null);
-	const [file, setFile] = useState<File | null>(null);
-	const [info, setInfo] = useState<VideoInfo | null>(null);
-	const [probeError, setProbeError] = useState<string | null>(null);
-	const [probing, setProbing] = useState(false);
-	const [frameCount, setFrameCount] = useState<number | null>(null);
-	const [h264, setH264] = useState<{ hw: boolean; sw: boolean } | null>(null);
+	const [queue, setQueue] = useState<QueueItem[]>([]);
+	const queueRef = useRef<QueueItem[]>([]);
+	const [selectedId, setSelectedId] = useState<string | null>(null);
+	const [queueRunning, setQueueRunning] = useState(false);
+	const stopRequested = useRef(false);
+	/** Lettura dei video in sequenza: una promessa per ogni video aggiunto. */
+	const probes = useRef(new Map<string, Promise<void>>());
+	/** Worker di trascrizione tenuto vivo tra un video e l'altro: il modello resta caricato. */
+	const sharedTranscriber = useRef<Worker | null>(null);
+	const leftoversCleared = useRef(false);
+	const [previewVideoId, setPreviewVideoId] = useState<string | null>(null);
 	const [leftover, setLeftover] = useState(0);
 	const [dragOver, setDragOver] = useState(false);
+	const [startError, setStartError] = useState<string | null>(null);
+	const [pageError, setPageError] = useState<string | null>(null);
+	/** Aperta dentro un'anteprima (iframe): il browser blocca l'elaborazione dei video. */
+	const embedded = useMemo(() => {
+		try {
+			return window.top !== window.self;
+		} catch {
+			return true;
+		}
+	}, []);
 
 	const [doFrames, setDoFrames] = useState(true);
 	const [doTranscribe, setDoTranscribe] = useState(true);
@@ -92,11 +134,7 @@ function App() {
 		hardwareAcceleration: 'prefer-hardware',
 	});
 
-	const [jobs, setJobs] = useState<Record<JobKey, JobState>>({
-		frames: idleJob(),
-		transcribe: idleJob(),
-		compress: idleJob(),
-	});
+	const [jobs, setJobs] = useState<Jobs>(idleJobs);
 	const [segments, setSegments] = useState<TranscriptSegment[]>([]);
 	const [logs, setLogs] = useState<LogLine[]>([]);
 	const workers = useRef<Partial<Record<JobKey, Worker>>>({});
@@ -111,59 +149,131 @@ function App() {
 			if (!c.opfs && c.dirPicker) setOutMode('dir');
 		});
 		leftoverBytes().then(setLeftover);
+		// Gli errori imprevisti compaiono sulla pagina, non solo nella console.
+		const onError = (e: ErrorEvent) => setPageError(e.message || 'Errore imprevisto');
+		const onRejection = (e: PromiseRejectionEvent) => setPageError(String((e.reason as Error)?.message ?? e.reason));
+		window.addEventListener('error', onError);
+		window.addEventListener('unhandledrejection', onRejection);
+		return () => {
+			window.removeEventListener('error', onError);
+			window.removeEventListener('unhandledrejection', onRejection);
+		};
 	}, []);
 
-	const running = Object.values(jobs).some((j) => j.status === 'running' || j.status === 'waiting');
+	const running = queueRunning || Object.values(jobs).some((j) => j.status === 'running' || j.status === 'waiting');
+
+	// Chiudere la pagina ferma la coda: il browser chiede conferma.
+	useEffect(() => {
+		if (!queueRunning) return;
+		const onBeforeUnload = (e: BeforeUnloadEvent) => {
+			e.preventDefault();
+			e.returnValue = '';
+		};
+		window.addEventListener('beforeunload', onBeforeUnload);
+		return () => window.removeEventListener('beforeunload', onBeforeUnload);
+	}, [queueRunning]);
 
 	const addLog = useCallback((job: string, level: LogLine['level'], message: string) => {
 		const time = new Date().toLocaleTimeString('it-IT');
 		setLogs((l) => [...l.slice(-400), { time, job, level, message }]);
 	}, []);
 
+	// Lo stato dei lavori è anche in un ref: la coda lo legge tra un passo e l'altro.
+	const jobsRef = useRef<Jobs>(idleJobs());
+	const setAllJobs = useCallback((j: Jobs) => {
+		jobsRef.current = j;
+		setJobs(j);
+	}, []);
 	const patchJob = useCallback((key: JobKey, patch: Partial<JobState>) => {
-		setJobs((j) => ({ ...j, [key]: { ...j[key], ...patch } }));
+		jobsRef.current = { ...jobsRef.current, [key]: { ...jobsRef.current[key], ...patch } };
+		setJobs(jobsRef.current);
 	}, []);
 
-	const loadFile = useCallback(
-		async (f: File) => {
-			if (running) return;
-			setFile(f);
-			setInfo(null);
-			setProbeError(null);
-			setFrameCount(null);
-			setH264(null);
-			setProbing(true);
-			setJobs({ frames: idleJob(), transcribe: idleJob(), compress: idleJob() });
-			setSegments([]);
-			try {
-				const vi = await probeVideo(f);
-				setInfo(vi);
-				if (vi.width && vi.height) {
-					const [hw, sw] = await Promise.all([
-						checkH264Encode(vi.width, vi.height, true),
-						checkH264Encode(vi.width, vi.height, false),
-					]);
-					setH264({ hw, sw });
-				}
-				if (!vi.canDecodeVideo) setDoFrames(false);
-				if (!vi.audioCodec || !vi.canDecodeAudio) setDoTranscribe(false);
-				const target = Math.min(480 * 1024 * 1024, Math.floor((vi.size * 0.75) / 1048576) * 1048576);
-				setCo((c) => ({ ...c, targetBytes: Math.max(1048576, target) }));
-			} catch (e) {
-				setProbeError((e as Error).message);
-			} finally {
-				setProbing(false);
-			}
-		},
-		[running],
+	const updateQueue = useCallback((fn: (q: QueueItem[]) => QueueItem[]) => {
+		queueRef.current = fn(queueRef.current);
+		setQueue(queueRef.current);
+	}, []);
+	const patchItem = useCallback(
+		(id: string, patch: Partial<QueueItem>) => updateQueue((q) => q.map((it) => (it.id === id ? { ...it, ...patch } : it))),
+		[updateQueue],
 	);
 
+	const probeItem = useCallback(
+		async (id: string, f: File) => {
+			try {
+				const vi = await probeVideo(f);
+				let h264: QueueItem['h264'] = null;
+				if (vi.width && vi.height) {
+					const [hw, sw] = await Promise.all([checkH264Encode(vi.width, vi.height, true), checkH264Encode(vi.width, vi.height, false)]);
+					h264 = { hw, sw };
+				}
+				patchItem(id, { info: vi, h264, probing: false });
+				// Con un solo video le opzioni si adattano al file, come prima della coda.
+				if (queueRef.current.length === 1) {
+					if (!vi.canDecodeVideo) setDoFrames(false);
+					if (!vi.audioCodec || !vi.canDecodeAudio) setDoTranscribe(false);
+					const target = Math.min(480 * 1024 * 1024, Math.floor((vi.size * 0.75) / 1048576) * 1048576);
+					setCo((c) => ({ ...c, targetBytes: Math.max(1048576, target) }));
+				}
+			} catch (e) {
+				patchItem(id, { error: (e as Error).message, probing: false });
+			}
+		},
+		[patchItem],
+	);
+
+	const addFiles = useCallback(
+		(files: File[]) => {
+			if (!files.length) return;
+			const items: QueueItem[] = files.map((f, i) => ({
+				id: `${Date.now().toString(36)}${i}${Math.random().toString(36).slice(2, 6)}`,
+				file: f,
+				info: null,
+				probing: true,
+				error: null,
+				h264: null,
+				frameCount: null,
+				status: 'pending',
+				jobs: null,
+			}));
+			updateQueue((q) => [...q, ...items]);
+			if (!queueRunning) setSelectedId(items[0].id);
+			// Un video alla volta, dopo quelli già in lettura.
+			let chain = Promise.all([...probes.current.values()]).then(() => {});
+			for (const it of items) {
+				chain = chain.then(() => probeItem(it.id, it.file));
+				probes.current.set(it.id, chain);
+			}
+		},
+		[queueRunning, updateQueue, probeItem],
+	);
+
+	const removeItem = (id: string) => {
+		updateQueue((q) => q.filter((it) => it.id !== id || it.status === 'running'));
+		if (selectedId === id) setSelectedId(null);
+	};
+
+	// Video mostrato: quello scelto nella lista, altrimenti quello in elaborazione, altrimenti il primo.
+	const current = queue.find((q) => q.id === selectedId) ?? queue.find((q) => q.status === 'running') ?? queue[0] ?? null;
+	const file = current?.file ?? null;
+	const info = current?.info ?? null;
+	const probing = current?.probing ?? false;
+	const probeError = current?.error ?? null;
+	const frameCount = current?.frameCount ?? null;
+	const h264 = current?.h264 ?? null;
+	const multi = queue.length > 1;
+
 	// conteggio esatto dei frame solo quando serve (modalità "tutti i frame")
+	const counted = useRef(new Set<string>());
 	useEffect(() => {
-		if (file && info && fo.mode === 'all' && frameCount === null) {
-			countFrames(file).then(setFrameCount).catch(() => setFrameCount(null));
+		if (current && current.info && fo.mode === 'all' && current.frameCount === null && !counted.current.has(current.id)) {
+			const id = current.id;
+			counted.current.add(id);
+			countFrames(current.file)
+				.then((n) => patchItem(id, { frameCount: n }))
+				.catch(() => {});
 		}
-	}, [file, info, fo.mode, frameCount]);
+	}, [current, fo.mode, patchItem]);
 
 	const estimate = useMemo(() => {
 		if (!info || !info.width || !info.height) return null;
@@ -184,20 +294,38 @@ function App() {
 			});
 			setDirHandle(h);
 			setOutMode('dir');
+			setStartError(null);
 			return h;
-		} catch {
-			return null; // annullato
+		} catch (e) {
+			const err = e as DOMException;
+			// L'elaborazione non parte mai in silenzio: si dice perché.
+			setStartError(
+				err?.name === 'AbortError'
+					? 'Nessuna cartella scelta. Scegli una cartella dove salvare i risultati, oppure seleziona "In memoria" (adatto solo a risultati piccoli).'
+					: `Il browser non ha aperto la scelta della cartella (${err?.message ?? err}). Seleziona "In memoria" oppure apri l'app in Chrome o Edge.`,
+			);
+			return null;
 		}
 	};
 
-	const runJob = (key: JobKey, name: WorkerName, msg: Record<string, unknown>) =>
+	const runJob = (key: JobKey, name: WorkerName, msg: Record<string, unknown>, reuse = false) =>
 		new Promise<void>((resolve) => {
-			const w = createWorker(name);
+			let w: Worker;
+			if (reuse && sharedTranscriber.current) w = sharedTranscriber.current;
+			else {
+				w = createWorker(name);
+				if (reuse) sharedTranscriber.current = w;
+			}
 			workers.current[key] = w;
 			const t0 = performance.now();
 			patchJob(key, { status: 'running', progress: { fraction: null, stage: 'Avvio', elapsedMs: 0, etaMs: null } });
-			const finish = () => {
-				w.terminate();
+			const finish = (keepAlive = false) => {
+				w.onmessage = null;
+				w.onerror = null;
+				if (!(reuse && keepAlive)) {
+					w.terminate();
+					if (sharedTranscriber.current === w) sharedTranscriber.current = null;
+				}
 				delete workers.current[key];
 				resolve();
 			};
@@ -222,7 +350,7 @@ function App() {
 							progress: { fraction: 1, stage: 'Completato', elapsedMs: performance.now() - t0, etaMs: 0 },
 						});
 						addLog(JOB_LABEL[key], m.complete ? 'info' : 'warn', m.summary);
-						finish();
+						finish(true);
 						break;
 					case 'error': {
 						const cancelled = /interrotto/i.test(m.message);
@@ -242,16 +370,28 @@ function App() {
 		});
 
 	const start = async () => {
-		if (!file || !info || running) return;
+		setStartError(null);
+		try {
+			await runQueue();
+		} catch (e) {
+			setStartError(`Avvio non riuscito: ${(e as Error)?.message ?? e}`);
+			addLog('Generale', 'error', `Avvio non riuscito: ${(e as Error)?.message ?? e}`);
+		}
+	};
+
+	const runQueue = async () => {
+		if (running || !queueRef.current.some((q) => q.status === 'pending' && !q.error)) return;
 		// il selettore di cartella va aperto subito, finché vale il clic dell'utente
 		let chosenDir = dirHandle;
 		if (outMode === 'dir' && !chosenDir) {
 			chosenDir = await pickDir();
 			if (!chosenDir) return;
 		}
-		const runId = Date.now().toString(36);
-		await clearLeftovers();
-		setLeftover(0);
+		if (!leftoversCleared.current) {
+			leftoversCleared.current = true;
+			await clearLeftovers();
+			setLeftover(0);
+		}
 		try {
 			await navigator.storage.persist?.();
 		} catch {
@@ -259,40 +399,116 @@ function App() {
 		}
 		let target: OutputTarget = { kind: 'opfs' };
 		if (outMode === 'dir' && chosenDir) {
-			const perm = await (chosenDir as unknown as { requestPermission(o: unknown): Promise<string> }).requestPermission?.({ mode: 'readwrite' });
+			const perm = await (chosenDir as unknown as { requestPermission?(o: unknown): Promise<string> }).requestPermission?.({ mode: 'readwrite' });
 			if (perm && perm !== 'granted') {
-				addLog('Generale', 'error', 'Permesso di scrittura sulla cartella negato.');
+				setStartError('Permesso di scrittura sulla cartella negato: consentilo quando il browser lo chiede, oppure scegli un\'altra cartella.');
 				return;
 			}
 			target = { kind: 'dir', handle: chosenDir };
 		}
+		stopRequested.current = false;
+		setQueueRunning(true);
+		const awake = await keepScreenAwake();
+		const total = queueRef.current.filter((q) => q.status === 'pending' && !q.error).length;
+		let done = 0;
+		try {
+			while (!stopRequested.current) {
+				const next = queueRef.current.find((q) => q.status === 'pending' && !q.error);
+				if (!next) break;
+				if (next.probing || !next.info) {
+					// video ancora in lettura: si aspetta
+					await probes.current.get(next.id);
+					const again = queueRef.current.find((q) => q.id === next.id);
+					if (again && again.probing) await new Promise((r) => setTimeout(r, 300));
+					continue;
+				}
+				done++;
+				await processItem(next, target, done, Math.max(total, done));
+			}
+			if (stopRequested.current) {
+				const left = queueRef.current.filter((q) => q.status === 'pending').length;
+				if (left) addLog('Coda', 'warn', `Coda interrotta: ${left} video non elaborati restano in coda.`);
+			} else if (done > 1) addLog('Coda', 'info', `Coda completata: ${done} video elaborati.`);
+		} finally {
+			sharedTranscriber.current?.terminate();
+			sharedTranscriber.current = null;
+			awake.release();
+			setQueueRunning(false);
+		}
+	};
+
+	const processItem = async (item: QueueItem, rootTarget: OutputTarget, index: number, total: number) => {
+		const vi = item.info as VideoInfo;
+		const f = item.file;
+		const baseName = baseNameOf(f);
+		patchItem(item.id, { status: 'running', jobs: null });
+		setSelectedId(item.id);
 		setSegments([]);
-		setJobs({
-			frames: doFrames ? { ...idleJob(), status: 'waiting' } : idleJob(),
-			transcribe: doTranscribe ? { ...idleJob(), status: 'waiting' } : idleJob(),
-			compress: doCompress ? { ...idleJob(), status: 'waiting' } : idleJob(),
+		setPreviewVideoId(item.id);
+		addLog('Coda', 'info', total > 1 ? `Video ${index} di ${total}: ${f.name}` : `Inizio: ${f.name}`);
+
+		// Le funzioni scelte valgono per tutta la coda; per ogni video si salta ciò che il file non permette.
+		const wantFrames = doFrames && vi.canDecodeVideo;
+		const wantTranscribe = doTranscribe && !!vi.audioCodec && vi.canDecodeAudio;
+		const wantCompress = doCompress && vi.canDecodeVideo;
+		if (doFrames && !wantFrames) addLog('Coda', 'warn', `${f.name}: il browser non decodifica il video, frame saltati.`);
+		if (doTranscribe && !wantTranscribe) addLog('Coda', 'warn', `${f.name}: audio assente o non decodificabile, trascrizione saltata.`);
+		if (doCompress && !wantCompress) addLog('Coda', 'warn', `${f.name}: video non decodificabile, compressione saltata.`);
+
+		// Con più video, ognuno nella sua sottocartella.
+		let target = rootTarget;
+		if (rootTarget.kind === 'dir' && queueRef.current.length > 1) {
+			try {
+				target = { kind: 'dir', handle: await rootTarget.handle.getDirectoryHandle(safeFolderName(baseName), { create: true }) };
+			} catch (e) {
+				addLog('Coda', 'warn', `Sottocartella per ${f.name} non creata (${(e as Error).message}): salvo nella cartella principale.`);
+			}
+		}
+		const runId = `${Date.now().toString(36)}${item.id.slice(-4)}`;
+		// L'obiettivo di compressione non supera mai il 75% del file di partenza.
+		const compressOptions: CompressOptions = {
+			...co,
+			targetBytes: Math.max(1048576, Math.min(co.targetBytes, Math.floor((vi.size * 0.75) / 1048576) * 1048576)),
+		};
+
+		setAllJobs({
+			frames: wantFrames ? { ...idleJob(), status: 'waiting' } : idleJob(),
+			transcribe: wantTranscribe ? { ...idleJob(), status: 'waiting' } : idleJob(),
+			compress: wantCompress ? { ...idleJob(), status: 'waiting' } : idleJob(),
 		});
-		const baseName = file.name.replace(/\.[^.]+$/, '');
 		const framesTask = () =>
-			runJob('frames', 'frames.worker', { file, options: fo, target, runId, encoder: workerSpec('encoder.worker') });
+			runJob('frames', 'frames.worker', { file: f, options: fo, target, runId, encoder: workerSpec('encoder.worker') });
 		const transcribeTask = () =>
-			runJob('transcribe', 'transcribe.worker', { file, options: to, target, runId, baseName, testEngine });
-		const compressTask = () => runJob('compress', 'compress.worker', { file, options: co, target, runId });
+			runJob('transcribe', 'transcribe.worker', { file: f, options: to, target, runId, baseName, testEngine }, true);
+		const compressTask = () => runJob('compress', 'compress.worker', { file: f, options: compressOptions, target, runId });
+		const stillWaiting = (k: JobKey) => !stopRequested.current && jobsRef.current[k].status === 'waiting';
 
 		if (parallel) {
 			// Audio e video su pipeline indipendenti; la compressione (che usa
 			// decodificatore e codificatore video) parte dopo l'estrazione dei frame.
 			const video = (async () => {
-				if (doFrames) await framesTask();
-				if (doCompress) await compressTask();
+				if (wantFrames && stillWaiting('frames')) await framesTask();
+				if (wantCompress && stillWaiting('compress')) await compressTask();
 			})();
-			const audio = doTranscribe ? transcribeTask() : Promise.resolve();
+			const audio = wantTranscribe && stillWaiting('transcribe') ? transcribeTask() : Promise.resolve();
 			await Promise.all([video, audio]);
 		} else {
-			if (doFrames) await framesTask();
-			if (doTranscribe) await transcribeTask();
-			if (doCompress) await compressTask();
+			if (wantFrames && stillWaiting('frames')) await framesTask();
+			if (wantTranscribe && stillWaiting('transcribe')) await transcribeTask();
+			if (wantCompress && stillWaiting('compress')) await compressTask();
 		}
+		for (const k of JOB_KEYS) if (jobsRef.current[k].status === 'waiting') patchJob(k, { status: 'cancelled' });
+
+		const final = jobsRef.current;
+		const statuses = Object.values(final).map((j) => j.status);
+		const status: QueueStatus = statuses.includes('error')
+			? 'error'
+			: statuses.includes('cancelled')
+				? 'cancelled'
+				: Object.values(final).some((j) => j.status === 'done' && j.complete === false)
+					? 'warn'
+					: 'done';
+		patchItem(item.id, { status, jobs: final });
 	};
 
 	const cancel = (key: JobKey) => {
@@ -306,18 +522,46 @@ function App() {
 		setTimeout(() => {
 			if (workers.current[key] === w) {
 				w.terminate();
+				if (sharedTranscriber.current === w) sharedTranscriber.current = null;
 				delete workers.current[key];
 				patchJob(key, { status: 'cancelled', error: 'Interrotto dall\'utente' });
 			}
 		}, 4000);
 	};
 
-	const cancelAll = () => (['frames', 'transcribe', 'compress'] as JobKey[]).forEach((k) => {
-		if (jobs[k].status === 'running') cancel(k);
-		else if (jobs[k].status === 'waiting') patchJob(k, { status: 'cancelled' });
-	});
+	const cancelAll = () => {
+		stopRequested.current = true;
+		JOB_KEYS.forEach((k) => {
+			if (jobsRef.current[k].status === 'running') cancel(k);
+			else if (jobsRef.current[k].status === 'waiting') patchJob(k, { status: 'cancelled' });
+		});
+	};
 
-	const canStart = !!file && !!info && !running && (doFrames || doTranscribe || doCompress);
+	const requeue = (id: string) => patchItem(id, { status: 'pending', jobs: null });
+
+	const pending = queue.filter((q) => q.status === 'pending').filter((q) => !q.error);
+	const anyEnabled = doFrames || doTranscribe || doCompress;
+	const canStart = !running && pending.length > 0 && pending.some((q) => !!q.info || q.probing) && anyEnabled;
+	// Se il pulsante non si può usare, sotto compare sempre il motivo.
+	const startBlocker = running
+		? null
+		: queue.length === 0
+			? 'Carica prima un video.'
+			: pending.length === 0 && queue.some((q) => q.status !== 'pending')
+				? 'Tutti i video in coda sono già stati elaborati: aggiungine altri o rimettine uno in coda.'
+				: pending.length === 0
+					? `Nessun video in coda si può elaborare${probeError ? `: ${probeError}` : '.'}`
+					: anyEnabled
+						? null
+						: 'Attiva almeno una funzione: frame, trascrizione o compressione.';
+
+	// Risultati mostrati: quelli in corso, oppure quelli salvati del video scelto nella lista.
+	const showLive = !!current && (current.status === 'running' || (!multi && current.jobs === null));
+	const shownJobs = showLive ? jobs : (current?.jobs ?? null);
+	const showPreview =
+		!!current && current.id === previewVideoId && (segments.length > 0 || (showLive && jobs.transcribe.status === 'running'));
+	const finishedCount = queue.filter((q) => q.status !== 'pending' && q.status !== 'running').length;
+	const startedCount = queue.filter((q) => q.status !== 'pending').length;
 
 	return (
 		<div className="app">
@@ -330,6 +574,27 @@ function App() {
 			</header>
 
 			<main className="content">
+				{embedded && (
+					<div className="banner" role="alert">
+						Stai vedendo l'app dentro un'anteprima, dove il browser blocca l'elaborazione dei video. Scarica il file
+						VideoFrameStudio.html e aprilo con Chrome o Edge (doppio clic sul file scaricato).
+					</div>
+				)}
+				{caps && !caps.webcodecs && (
+					<div className="banner" role="alert">
+						Questo browser non supporta WebCodecs, necessario per leggere i video. Apri l'app con Google Chrome o Microsoft Edge
+						aggiornati.
+					</div>
+				)}
+				{pageError && (
+					<div className="banner" role="alert">
+						Errore: {pageError}{' '}
+						<button type="button" className="link" onClick={() => setPageError(null)}>
+							Chiudi
+						</button>
+					</div>
+				)}
+
 				<section
 					className={`drop ${dragOver ? 'over' : ''} ${file ? 'has-file' : ''}`}
 					onDragOver={(e) => {
@@ -340,27 +605,37 @@ function App() {
 					onDrop={(e) => {
 						e.preventDefault();
 						setDragOver(false);
-						const f = e.dataTransfer.files?.[0];
-						if (f) loadFile(f);
+						addFiles(Array.from(e.dataTransfer.files ?? []));
 					}}
 				>
 					<label className="drop-inner" htmlFor="file-input">
-						<strong>Trascina qui il tuo video oppure seleziona un file</strong>
-						<span>MP4, MOV, MKV, WebM · nessun limite di dimensione · il file non lascia il tuo computer</span>
-						<span className="button ghost">Scegli un file…</span>
+						<strong>{queue.length ? 'Trascina qui altri video da mettere in coda' : 'Trascina qui i tuoi video oppure selezionali'}</strong>
+						<span>MP4, MOV, MKV, WebM · anche più video insieme: vengono elaborati uno alla volta · i file non lasciano il tuo computer</span>
+						<span className="button ghost">{queue.length ? 'Aggiungi video…' : 'Scegli i video…'}</span>
 					</label>
 					<input
 						id="file-input"
 						type="file"
 						accept="video/*,.mkv,.mov,.mp4,.webm"
-						disabled={running}
+						multiple
 						onChange={(e) => {
-							const f = e.target.files?.[0];
-							if (f) loadFile(f);
+							addFiles(Array.from(e.target.files ?? []));
 							e.target.value = '';
 						}}
 					/>
 				</section>
+
+				{multi && (
+					<QueueList
+						queue={queue}
+						selectedId={current?.id ?? null}
+						onSelect={setSelectedId}
+						onRemove={removeItem}
+						onRequeue={requeue}
+						onClearFinished={() => updateQueue((q) => q.filter((it) => it.status === 'pending' || it.status === 'running'))}
+						running={running}
+					/>
+				)}
 
 				{file && <FileSlate file={file} info={info} probing={probing} error={probeError} />}
 
@@ -369,7 +644,7 @@ function App() {
 						title="Estrazione frame"
 						enabled={doFrames}
 						onToggle={setDoFrames}
-						disabled={!!info && !info.canDecodeVideo}
+						disabled={!multi && !!info && !info.canDecodeVideo}
 						disabledNote="Il browser non decodifica il video di questo file."
 					>
 						<div className="seg" role="radiogroup" aria-label="Modalità">
@@ -524,7 +799,7 @@ function App() {
 						title="Trascrizione"
 						enabled={doTranscribe}
 						onToggle={setDoTranscribe}
-						disabled={!!info && (!info.audioCodec || !info.canDecodeAudio)}
+						disabled={!multi && !!info && (!info.audioCodec || !info.canDecodeAudio)}
 						disabledNote={info && !info.audioCodec ? 'Il file non contiene audio.' : 'Il browser non decodifica l\'audio di questo file.'}
 					>
 						<div className="row">
@@ -691,23 +966,44 @@ function App() {
 					</div>
 					<div className="launch-actions">
 						<button type="button" className="primary" disabled={!canStart} onClick={start}>
-							AVVIA ELABORAZIONE
+							{pending.length > 1 ? `AVVIA ELABORAZIONE · ${pending.length} VIDEO` : 'AVVIA ELABORAZIONE'}
 						</button>
+						{running && multi && (
+							<p className="start-note">
+								Video {Math.min(startedCount, queue.length)} di {queue.length} · {finishedCount} finiti · si procede uno alla volta
+							</p>
+						)}
 						{running && (
 							<button type="button" className="button ghost" onClick={cancelAll}>
-								Interrompi tutto
+								{multi ? 'Interrompi la coda' : 'Interrompi tutto'}
 							</button>
+						)}
+						{multi && caps && !caps.opfs && outMode === 'opfs' && (
+							<p className="start-note">Con più video conviene salvare in una cartella del PC: "in memoria" tiene tutti i risultati nella RAM.</p>
+						)}
+						{multi && outMode === 'dir' && <p className="hint">Ogni video avrà la sua sottocartella con il proprio nome.</p>}
+						{running && multi && (
+							<p className="hint">
+								Tieni la pagina aperta: chiuderla ferma la coda. Il PC non va in standby finché la scheda resta in primo piano.
+							</p>
+						)}
+						{!canStart && startBlocker && <p className="start-note">{startBlocker}</p>}
+						{startError && (
+							<p className="start-note error-text" role="alert">
+								{startError}
+							</p>
 						)}
 					</div>
 				</section>
 
-				{(['frames', 'transcribe', 'compress'] as JobKey[])
-					.filter((k) => jobs[k].status !== 'idle')
-					.map((k) => (
-						<JobCard key={k} jobKey={k} job={jobs[k]} onCancel={() => cancel(k)} />
+				{multi && current && shownJobs && <h2 className="results-title">Risultati · {current.file.name}</h2>}
+
+				{shownJobs &&
+					JOB_KEYS.filter((k) => shownJobs[k].status !== 'idle').map((k) => (
+						<JobCard key={k} jobKey={k} job={shownJobs[k]} onCancel={() => cancel(k)} downloadPrefix={multi && current ? baseNameOf(current.file) : undefined} />
 					))}
 
-				{(segments.length > 0 || jobs.transcribe.status === 'running') && <TranscriptPreview segments={segments} running={jobs.transcribe.status === 'running'} />}
+				{showPreview && <TranscriptPreview segments={segments} running={showLive && jobs.transcribe.status === 'running'} />}
 
 				{logs.length > 0 && (
 					<details className="log">
@@ -798,6 +1094,72 @@ function FileSlate({ file, info, probing, error }: { file: File; info: VideoInfo
 	);
 }
 
+const QUEUE_STATUS: Record<QueueStatus, string> = {
+	pending: 'In coda',
+	running: 'In elaborazione',
+	done: 'Completato',
+	warn: 'Completato con avvisi',
+	error: 'Errore',
+	cancelled: 'Interrotto',
+};
+
+function QueueList(props: {
+	queue: QueueItem[];
+	selectedId: string | null;
+	onSelect: (id: string) => void;
+	onRemove: (id: string) => void;
+	onRequeue: (id: string) => void;
+	onClearFinished: () => void;
+	running: boolean;
+}) {
+	const finished = props.queue.filter((q) => q.status !== 'pending' && q.status !== 'running').length;
+	const totalSec = props.queue.reduce((a, q) => a + (q.info?.duration ?? 0), 0);
+	return (
+		<section className="queue" aria-label="Coda dei video">
+			<header>
+				<h2>Coda · {props.queue.length} video</h2>
+				<span className="hint">
+					{totalSec > 0 && <>{hms(totalSec)} in totale · </>}
+					{finished} finiti · elaborati uno alla volta, nell'ordine
+				</span>
+				{finished > 0 && (
+					<button type="button" className="link" onClick={props.onClearFinished}>
+						Togli i finiti dalla lista
+					</button>
+				)}
+			</header>
+			<ol>
+				{props.queue.map((q, i) => (
+					<li key={q.id} className={`${q.status} ${q.id === props.selectedId ? 'sel' : ''}`}>
+						<button type="button" className="q-main" onClick={() => props.onSelect(q.id)} aria-pressed={q.id === props.selectedId}>
+							<span className="q-num">{i + 1}</span>
+							<span className="q-name" title={q.file.name}>
+								{q.file.name}
+							</span>
+							<span className="q-meta">{q.error ? 'non leggibile' : q.info ? `${hms(q.info.duration)} · ${formatBytes(q.file.size)}` : 'lettura…'}</span>
+						</button>
+						<span className={`pill ${q.status === 'warn' ? 'done' : q.status === 'pending' ? 'waiting' : q.status}`}>
+							{q.error && q.status === 'pending' ? 'Non elaborabile' : QUEUE_STATUS[q.status]}
+						</span>
+						<span className="q-actions">
+							{(q.status === 'done' || q.status === 'warn' || q.status === 'error' || q.status === 'cancelled') && !q.error && (
+								<button type="button" className="link" onClick={() => props.onRequeue(q.id)}>
+									Rimetti in coda
+								</button>
+							)}
+							{q.status !== 'running' && (
+								<button type="button" className="link" onClick={() => props.onRemove(q.id)} aria-label={`Togli ${q.file.name} dalla coda`}>
+									Togli
+								</button>
+							)}
+						</span>
+					</li>
+				))}
+			</ol>
+		</section>
+	);
+}
+
 function Panel(props: {
 	title: string;
 	enabled: boolean;
@@ -837,7 +1199,18 @@ const DOWNLOAD_LABEL: Record<string, string> = {
 	'VIDEO_COMPRESSO.mp4': 'Scarica VIDEO_COMPRESSO.mp4',
 };
 
-function JobCard({ jobKey, job, onCancel }: { jobKey: JobKey; job: JobState; onCancel: () => void }) {
+function JobCard({
+	jobKey,
+	job,
+	onCancel,
+	downloadPrefix,
+}: {
+	jobKey: JobKey;
+	job: JobState;
+	onCancel: () => void;
+	/** Con più video, il nome del video davanti al file scaricato ("lezione 3 - TRASCRIZIONE.txt"). */
+	downloadPrefix?: string;
+}) {
 	const p = job.progress;
 	const pct = p?.fraction != null ? Math.round(p.fraction * 1000) / 10 : null;
 	const statusText: Record<JobStatus, string> = {
@@ -888,7 +1261,16 @@ function JobCard({ jobKey, job, onCancel }: { jobKey: JobKey; job: JobState; onC
 								Salvato nella cartella: <b>{o.name}</b> ({formatBytes(o.bytes)})
 							</span>
 						) : (
-							<button key={o.name} type="button" className="download" onClick={() => downloadOutput(o).catch((e) => alert(e.message))}>
+							<button
+								key={o.name}
+								type="button"
+								className="download"
+								onClick={() =>
+									downloadOutput(downloadPrefix ? { ...o, downloadName: `${downloadPrefix} - ${o.downloadName}` } : o).catch((e) =>
+										alert(e.message),
+									)
+								}
+							>
 								{DOWNLOAD_LABEL[o.downloadName] ?? `Scarica ${o.downloadName}`}
 								<small>{formatBytes(o.bytes)}</small>
 							</button>

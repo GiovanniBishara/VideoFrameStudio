@@ -224,3 +224,41 @@ export function estimateImageBytes(width: number, height: number, format: 'jpeg'
 	const px = width * height;
 	return format === 'png' ? px * 0.8 : px * (0.05 + 0.15 * quality * quality);
 }
+
+/**
+ * Tiene acceso lo schermo durante una coda lunga (il PC non va in standby finché la
+ * scheda resta in primo piano). Il blocco si perde quando la scheda va in secondo
+ * piano: viene richiesto di nuovo al ritorno.
+ */
+export async function keepScreenAwake(): Promise<{ release(): void }> {
+	const wl = (navigator as Navigator & { wakeLock?: { request(type: 'screen'): Promise<WakeLockSentinelLike> } }).wakeLock;
+	if (!wl) return { release() {} };
+	let sentinel: WakeLockSentinelLike | null = null;
+	let active = true;
+	const acquire = async () => {
+		try {
+			if (active && document.visibilityState === 'visible' && (!sentinel || sentinel.released)) {
+				sentinel = await wl.request('screen');
+			}
+		} catch {
+			/* non concesso: si continua senza */
+		}
+	};
+	const onVisibility = () => {
+		void acquire();
+	};
+	document.addEventListener('visibilitychange', onVisibility);
+	await acquire();
+	return {
+		release() {
+			active = false;
+			document.removeEventListener('visibilitychange', onVisibility);
+			sentinel?.release().catch(() => {});
+		},
+	};
+}
+
+interface WakeLockSentinelLike {
+	released: boolean;
+	release(): Promise<void>;
+}
