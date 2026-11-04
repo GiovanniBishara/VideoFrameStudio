@@ -1,6 +1,8 @@
 // Trascrizione: estrazione e decodifica progressiva dell'audio (Mediabunny),
 // conversione a 16 kHz mono, riconoscimento con Whisper multilingue
 // (Transformers.js, WebGPU quando disponibile, altrimenti WebAssembly).
+// Il worker resta vivo tra un video e l'altro della coda: il modello già caricato
+// viene riutilizzato.
 
 import { ALL_FORMATS, AudioSampleSink, BlobSource, Input } from 'mediabunny';
 import { estimateEta, formatDuration, formatNumber, hms } from '../shared/format';
@@ -11,10 +13,13 @@ import {
 	runTranscription,
 	type AsrEngine,
 	type AudioFeed,
+	type CoreTiming,
 	type RawSegment,
 	type WindowRequest,
+	type WindowResult,
 } from '../shared/transcribeCore';
 import { buildSrt, buildTxt } from '../shared/transcriptText';
+import { LogprobTracker, applyTimestampRules } from '../shared/whisperRules';
 import type { OutputRef, OutputTarget, TranscribeOptions, TranscriptSegment, WorkerOut } from '../shared/types';
 
 /** Versione fissata e verificata della libreria (caricata dal CDN jsDelivr e poi dalla cache del browser). */
@@ -48,6 +53,7 @@ self.onmessage = (e: MessageEvent<StartMsg | { type: 'cancel' }>) => {
 		cancelled = true;
 		return;
 	}
+	cancelled = false;
 	run(e.data).catch((err) => post({ type: 'error', message: String((err as Error)?.message ?? err) }));
 };
 
@@ -64,6 +70,8 @@ class DecodedAudioFeed implements AudioFeed {
 	/** Al massimo 10 minuti di audio decodificato in anticipo (≈ 38 MB). */
 	private static readonly MAX_AHEAD = SAMPLE_RATE * 600;
 	decodedSec = 0;
+	/** Tempo passato ad aspettare l'audio decodificato (per il riepilogo dei tempi). */
+	waitMs = 0;
 
 	constructor(readonly expectedDuration: number) {}
 
@@ -110,8 +118,12 @@ class DecodedAudioFeed implements AudioFeed {
 	}
 
 	async read(start: number, end: number): Promise<Float32Array> {
-		while (!this.ended && this.produced < end) {
-			await new Promise<void>((r) => this.waiters.push(r));
+		if (!this.ended && this.produced < end) {
+			const t0 = performance.now();
+			while (!this.ended && this.produced < end) {
+				await new Promise<void>((r) => this.waiters.push(r));
+			}
+			this.waitMs += performance.now() - t0;
 		}
 		if (this.error) throw this.error;
 		const stop = Math.min(end, this.produced);
@@ -209,6 +221,7 @@ class WhisperEngine implements AsrEngine {
 	) {}
 
 	async load(device: 'webgpu' | 'wasm') {
+		this.prepared = null; // un modello diverso dà un encoder diverso
 		let f16 = false;
 		if (device === 'webgpu') {
 			const gpu = (navigator as Navigator & { gpu?: { requestAdapter(o?: unknown): Promise<{ features: Set<string> } | null> } }).gpu;
@@ -223,7 +236,13 @@ class WhisperEngine implements AsrEngine {
 		const candidates: Record<string, string>[] =
 			device === 'webgpu'
 				? [
-						...(f16 ? [{ encoder_model: 'fp16', decoder_model_merged: 'q4' }] : []),
+						// decoder a 16 bit: più preciso del 4 bit sui termini tecnici
+						...(f16
+							? [
+									{ encoder_model: 'fp16', decoder_model_merged: 'fp16' },
+									{ encoder_model: 'fp16', decoder_model_merged: 'q4' },
+								]
+							: []),
 						{ encoder_model: 'fp32', decoder_model_merged: 'q4' },
 						{ encoder_model: 'fp32', decoder_model_merged: 'fp32' },
 					]
@@ -254,7 +273,13 @@ class WhisperEngine implements AsrEngine {
 
 	setPrompt(text: string) {
 		const clean = text.replace(/\s+/g, ' ').trim();
-		if (!clean) return;
+		if (!clean) {
+			// video successivo senza contesto: nessun prompt residuo
+			this.promptIds = [];
+			this.promptText = '';
+			this.hasPrompt = false;
+			return;
+		}
 		const ids: number[] = Array.from(this.pipe.tokenizer.encode(' ' + clean, { add_special_tokens: false }), Number);
 		// Limite di 120 token: il resto della finestra resta per il testo trascritto.
 		this.promptIds = ids.slice(-120);
@@ -289,22 +314,174 @@ class WhisperEngine implements AsrEngine {
 		return m ? m[1] : null;
 	}
 
-	async transcribeWindow(audio: Float32Array, req: WindowRequest): Promise<RawSegment[]> {
+	/** Regole del Whisper originale e confidenza attive; si spengono da sole se la libreria le rifiuta. */
+	private customRules = true;
+	private rulesChecked = false;
+
+	/**
+	 * Encoder calcolato una volta per finestra e riusato nei nuovi tentativi della stessa
+	 * finestra (stesso audio → stesso risultato: il testo non cambia, si risparmia la parte
+	 * più pesante). Si spegne da solo se la libreria non lo accetta.
+	 */
+	private encoderReuse = true;
+	private encoderCallsInLibrary = 0;
+	private prepared: { audio: Float32Array; features: unknown; encoder: unknown | null } | null = null;
+	/** Tempi misurati, per il riepilogo nel registro. */
+	readonly stats = { featuresMs: 0, encoderMs: 0, generateMs: 0, tokens: 0, generations: 0, encoderReused: 0 };
+
+	private async prepare(audio: Float32Array) {
+		if (this.prepared && this.prepared.audio === audio) {
+			if (this.prepared.encoder) this.stats.encoderReused++;
+			return this.prepared;
+		}
+		this.prepared = null; // libera la finestra precedente
+		const t0 = performance.now();
 		const { input_features } = await this.pipe.processor(audio);
+		const t1 = performance.now();
+		this.stats.featuresMs += t1 - t0;
+		let encoder: unknown | null = null;
+		if (this.encoderReuse) {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const model: any = this.pipe.model;
+			try {
+				if (!model.__vftsEncode) {
+					// La libreria calcola l'encoder in questa funzione: la si usa uguale (stesso calcolo)
+					// e si contano le chiamate fatte dalla libreria, per accorgersi se il riuso non funziona.
+					model.__vftsEncode = model._prepare_encoder_decoder_kwargs_for_generation;
+					model._prepare_encoder_decoder_kwargs_for_generation = (...args: unknown[]) => {
+						this.encoderCallsInLibrary++;
+						return model.__vftsEncode.apply(model, args);
+					};
+					if (!model.forward_params.includes('encoder_outputs')) {
+						model.forward_params = [...model.forward_params, 'encoder_outputs'];
+					}
+				}
+				const r = await model.__vftsEncode.call(model, {
+					inputs_tensor: input_features,
+					model_inputs: { input_features },
+					model_input_name: 'input_features',
+					generation_config: { guidance_scale: null },
+				});
+				encoder = r?.encoder_outputs ?? null;
+				if (!encoder) throw new Error('risultato assente');
+				this.stats.encoderMs += performance.now() - t1;
+			} catch (e) {
+				this.encoderReuse = false;
+				encoder = null;
+				log('warn', `Riuso dell'encoder non disponibile (${(e as Error).message}): ogni tentativo lo ricalcola.`);
+			}
+		}
+		this.prepared = { audio, features: input_features, encoder };
+		return this.prepared;
+	}
+
+	async transcribeWindow(audio: Float32Array, req: WindowRequest): Promise<WindowResult> {
+		const prep = await this.prepare(audio);
+		const input_features = prep.features;
 		const init: number[] = [];
 		if (req.usePrompt && this.promptIds.length) init.push(this.tok('<|startofprev|>'), ...this.promptIds);
 		init.push(this.tok('<|startoftranscript|>'), this.tok(`<|${req.language}|>`), this.tok('<|transcribe|>'));
-		const out = await this.pipe.model.generate({
-			inputs: input_features,
-			decoder_input_ids: init,
-			return_timestamps: true,
-			// Con max_new_tokens esplicito la libreria non applica il proprio "seek":
-			// l'avanzamento tra finestre è gestito da runTranscription.
-			max_new_tokens: Math.min(440, 448 - init.length),
-			...(req.attempt > 0 ? { no_repeat_ngram_size: 6 } : {}),
-		});
-		const ids = this.toList(out).slice(init.length);
-		return this.parse(ids);
+		const temperature = req.temperature ?? 0;
+		const tsBegin = Number(this.pipe.tokenizer.timestamp_begin);
+
+		const generate = async (custom: boolean, useEncoder: boolean) => {
+			const tracker = new LogprobTracker(temperature);
+			let logitsProcessor: unknown;
+			if (custom) {
+				type Proc = (ids: bigint[][], logits: { data: Float32Array }[]) => unknown;
+				// Regole sui timestamp prima, misura della confidenza per ultima (sui logit finali).
+				const processors: Proc[] = [
+					(ids, logits) => (applyTimestampRules(ids[0].slice(init.length).map(Number), logits[0].data, tsBegin), logits),
+					(ids, logits) => {
+						const row = ids[0];
+						tracker.step(row.length > init.length ? Number(row[row.length - 1]) : null, logits[0].data);
+						return logits;
+					},
+				];
+				// La libreria aggiunge i propri processori con push/extend: restano prima della misura.
+				logitsProcessor = {
+					processors,
+					push(p: Proc) {
+						processors.splice(processors.length - 1, 0, p);
+					},
+					extend(list: Proc[]) {
+						for (const p of list) processors.splice(processors.length - 1, 0, p);
+					},
+					[Symbol.iterator]() {
+						return processors.values();
+					},
+				};
+			}
+			const encoder = useEncoder ? prep.encoder : null;
+			const callsBefore = this.encoderCallsInLibrary;
+			const t0 = performance.now();
+			const out = await this.pipe.model.generate({
+				inputs: input_features,
+				...(encoder ? { encoder_outputs: encoder } : {}),
+				decoder_input_ids: init,
+				return_timestamps: true,
+				// Con max_new_tokens esplicito la libreria non applica il proprio "seek":
+				// l'avanzamento tra finestre è gestito da runTranscription.
+				max_new_tokens: Math.min(440, 448 - init.length),
+				...(temperature > 0 ? { do_sample: true, temperature } : {}),
+				...(req.attempt > 0 ? { no_repeat_ngram_size: 6 } : {}),
+				...(logitsProcessor ? { logits_processor: logitsProcessor } : {}),
+			});
+			const ids = this.toList(out).slice(init.length);
+			this.stats.generateMs += performance.now() - t0;
+			this.stats.tokens += ids.length;
+			this.stats.generations++;
+			if (encoder && this.encoderCallsInLibrary !== callsBefore) {
+				this.encoderReuse = false;
+				log('warn', "La libreria ricalcola comunque l'encoder: riuso disattivato (nessun effetto sul testo).");
+			}
+			tracker.finish(ids.length ? ids[ids.length - 1] : null);
+			return { ids, tracker };
+		};
+
+		// Con l'encoder riusato; se la libreria lo rifiuta si riprova senza e il riuso si spegne.
+		const run = async (custom: boolean) => {
+			if (this.encoderReuse && prep.encoder) {
+				try {
+					return await generate(custom, true);
+				} catch (e) {
+					const r = await generate(custom, false).catch(() => {
+						throw e;
+					});
+					this.encoderReuse = false;
+					log('warn', `Riuso dell'encoder disattivato (${(e as Error).message}): nessun effetto sul testo.`);
+					return r;
+				}
+			}
+			return generate(custom, false);
+		};
+
+		let result: { ids: number[]; tracker: LogprobTracker };
+		if (this.customRules) {
+			try {
+				result = await run(true);
+			} catch (e) {
+				// Se senza le regole aggiuntive funziona, il problema erano le regole: si spengono.
+				result = await run(false).catch(() => {
+					throw e;
+				});
+				this.customRules = false;
+				log('warn', `Regole aggiuntive di Whisper disattivate (${(e as Error).message}): uso la decodifica standard.`);
+			}
+			// Alla prima finestra si verifica che la libreria abbia davvero usato i processori.
+			if (this.customRules && !this.rulesChecked && result.ids.length > 0) {
+				this.rulesChecked = true;
+				if (result.tracker.count === 0) {
+					this.customRules = false;
+					log('warn', 'La libreria non ha applicato le regole aggiuntive di Whisper: uso la decodifica standard.');
+				} else {
+					log('info', 'Regole di decodifica del Whisper originale attive (inizio entro 1 s, tempi crescenti, confidenza per finestra).');
+				}
+			}
+		} else {
+			result = await run(false);
+		}
+		return { segments: this.parse(result.ids), avgLogprob: this.customRules ? result.tracker.average : null };
 	}
 
 	private parse(ids: number[]): RawSegment[] {
@@ -348,6 +525,9 @@ class WhisperEngine implements AsrEngine {
 
 // --- lavoro principale -----------------------------------------------------------
 
+/** Modello caricato, tenuto tra un video e l'altro della coda. */
+let cachedEngine: { key: string; engine: WhisperEngine } | null = null;
+
 async function run(msg: StartMsg) {
 	const { file, options: o, target, runId, baseName } = msg;
 	const t0 = performance.now();
@@ -365,6 +545,8 @@ async function run(msg: StartMsg) {
 	// 2) modello
 	let engine: AsrEngine;
 	let engineLabel = '';
+	let whisperForStats: WhisperEngine | null = null;
+	let statsBefore: WhisperEngine['stats'] | null = null;
 	if (__TEST_BUILD__ && msg.testEngine) {
 		// Solo build di test (eliminato dalla build pubblicata): verifica la pipeline senza modello.
 		const { FakeToneEngine } = await import('../test/fakeEngine');
@@ -384,36 +566,49 @@ async function run(msg: StartMsg) {
 		tf.env.useBrowserCache = true;
 		const modelId = MODEL_IDS[o.model];
 		const loadStart = performance.now();
-		const whisper = new WhisperEngine(tf, modelId, (loaded, total) => {
-			const now = performance.now();
-			if (now - lastPost < 250) return;
-			lastPost = now;
-			post({
-				type: 'progress',
-				progress: {
-					fraction: loaded / total,
-					stage: 'Download del modello (solo la prima volta, poi resta in cache)',
-					detail: `${modelId} · ${formatNumber(loaded / 1048576)} / ${formatNumber(total / 1048576)} MB`,
-					elapsedMs: now - loadStart,
-					etaMs: estimateEta(loaded / total, now - loadStart),
-				},
-			});
-		});
-		try {
-			await whisper.load(o.device);
-		} catch (e) {
-			if (o.device === 'webgpu') {
-				log('warn', `WebGPU non utilizzabile (${(e as Error).message}): uso WebAssembly, più lento.`);
-				await whisper.load('wasm');
-			} else throw e;
+		const key = `${modelId}|${o.device}`;
+		const reused = !!cachedEngine && cachedEngine.key === key && cachedEngine.engine.device === o.device;
+		const whisper = reused
+			? cachedEngine!.engine
+			: new WhisperEngine(tf, modelId, (loaded, total) => {
+					const now = performance.now();
+					if (now - lastPost < 250) return;
+					lastPost = now;
+					post({
+						type: 'progress',
+						progress: {
+							fraction: loaded / total,
+							stage: 'Download del modello (solo la prima volta, poi resta in cache)',
+							detail: `${modelId} · ${formatNumber(loaded / 1048576)} / ${formatNumber(total / 1048576)} MB`,
+							elapsedMs: now - loadStart,
+							etaMs: estimateEta(loaded / total, now - loadStart),
+						},
+					});
+				});
+		if (!reused) {
+			cachedEngine = null;
+			try {
+				await whisper.load(o.device);
+			} catch (e) {
+				if (o.device === 'webgpu') {
+					log('warn', `WebGPU non utilizzabile (${(e as Error).message}): uso WebAssembly, più lento.`);
+					await whisper.load('wasm');
+				} else throw e;
+			}
+			cachedEngine = { key, engine: whisper };
 		}
-		if (o.context.trim()) {
-			whisper.setPrompt(o.context);
-			log('info', 'Contesto (corso e termini) usato come prompt iniziale di Whisper.');
-		}
+		whisper.setPrompt(o.context);
+		if (o.context.trim()) log('info', 'Contesto (corso e termini) usato come prompt iniziale di Whisper.');
 		engine = whisper;
+		whisperForStats = whisper;
+		statsBefore = { ...whisper.stats };
 		engineLabel = `${modelId} · ${whisper.device === 'webgpu' ? 'WebGPU' : 'WebAssembly (CPU)'} · ${whisper.dtypeLabel}`;
-		log('info', `Modello pronto in ${formatDuration(performance.now() - loadStart)}: ${engineLabel}`);
+		log(
+			'info',
+			reused
+				? `Modello già caricato dal video precedente, riutilizzato: ${engineLabel}`
+				: `Modello pronto in ${formatDuration(performance.now() - loadStart)}: ${engineLabel}`,
+		);
 	}
 
 	// 3) trascrizione
@@ -471,11 +666,14 @@ async function run(msg: StartMsg) {
 	}
 	const outputs = await writeOutputs(target, runId, baseName, result.segments, result.gaps, o, header, !result.complete);
 	const elapsed = (performance.now() - tStart) / 1000;
+	logTiming(elapsed * 1000, result.timing, feed.waitMs, whisperForStats, statsBefore);
 	const summary =
 		`${formatNumber(result.segments.length)} segmenti · audio ${hms(coveredSec)} trascritto in ${formatDuration(elapsed * 1000)} ` +
 		`(${formatNumber(coveredSec / Math.max(0.001, elapsed), 1)}× tempo reale) · lingua: ${result.language}` +
 		(result.silenceSec >= 1 ? ` · ${hms(result.silenceSec)} di silenzio` : '') +
 		(result.retries ? ` · ${result.retries} finestre ripetute per sicurezza` : '') +
+		(result.recovered ? ` · ${result.recovered} segmenti recuperati nei tratti saltati` : '') +
+		(result.lowConfidence ? ` · ${result.lowConfidence} finestre a bassa confidenza (da ricontrollare)` : '') +
 		` · ${engineLabel}`;
 	post({
 		type: 'done',
@@ -484,6 +682,43 @@ async function run(msg: StartMsg) {
 		complete: result.complete,
 		extra: { gaps: result.gaps, language: result.language, audioSec: coveredSec },
 	});
+}
+
+/** Due righe nel registro: dove è andato il tempo, e quanto costano encoder e generazione del testo. */
+function logTiming(
+	totalMs: number,
+	timing: CoreTiming,
+	waitMs: number,
+	whisper: WhisperEngine | null,
+	before: WhisperEngine['stats'] | null,
+) {
+	const d = (ms: number) => formatDuration(ms);
+	const pct = (ms: number) => `${Math.round((ms / Math.max(1, totalMs)) * 100)}%`;
+	log(
+		'info',
+		`Tempi: primo passaggio ${d(timing.firstMs)} (${pct(timing.firstMs)}) · nuovi tentativi ${d(timing.retryMs)} (${pct(timing.retryMs)}) · ` +
+			`seconda passata ${d(timing.repassMs)} (${pct(timing.repassMs)}) · attesa dell'audio ${d(waitMs)} (${pct(waitMs)})`,
+	);
+	if (!whisper || !before) return;
+	const now = whisper.stats;
+	const generations = now.generations - before.generations;
+	const tokens = now.tokens - before.tokens;
+	const encMs = now.encoderMs - before.encoderMs;
+	const genMs = now.generateMs - before.generateMs;
+	const featMs = now.featuresMs - before.featuresMs;
+	const reused = now.encoderReused - before.encoderReused;
+	const encCount = generations - reused;
+	log(
+		'info',
+		`Modello: preparazione audio ${d(featMs)} · ` +
+			(encMs > 0
+				? `encoder ${d(encMs)}${encCount > 0 ? ` (${formatNumber(encMs / encCount / 1000, 2)} s per finestra)` : ''}`
+				: 'encoder compreso nella generazione') +
+			` · generazione del testo ${d(genMs)} (${formatNumber(tokens)} token` +
+			(tokens > 0 ? `, ${formatNumber(genMs / tokens, 1)} ms l'uno` : '') +
+			')' +
+			(reused > 0 ? ` · encoder riusato ${reused} volte nei nuovi tentativi` : ''),
+	);
 }
 
 async function writeOutputs(
