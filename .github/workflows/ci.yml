@@ -1,0 +1,54 @@
+name: CI e pubblicazione
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - name: Controllo dei tipi
+        run: npm run typecheck
+      - name: Test unitari
+        run: npm test
+      - name: Build del sito
+        run: npm run build
+      - name: Build del file unico
+        run: npm run build:single
+      - name: File unico scaricabile anche dal sito
+        run: cp dist-single/VideoFrameStudio.html dist/VideoFrameStudio.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VideoFrameStudio-html
+          path: dist-single/VideoFrameStudio.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

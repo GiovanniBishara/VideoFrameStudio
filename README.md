@@ -1,97 +1,136 @@
 # VideoFrame & Transcript Studio
 
-Web app che, caricando una sola volta un video (anche oltre 1 GB), produce:
+**Turn hours of recorded lectures into slides and searchable text, entirely in your browser.**
 
-- **FRAMES.zip** – fotogrammi in ordine cronologico, con `frames_index.csv`
-- **TRASCRIZIONE.txt** – trascrizione completa con Whisper (opzionale `SOTTOTITOLI.srt`)
-- **VIDEO_COMPRESSO.mp4** – solo se richiesto, H.264 verso una dimensione obiettivo
+Drop one or more lecture recordings (even 1+ GB each) and get, for every video:
 
-Tutto avviene nel browser (Chrome o Edge su Windows 11): il video non viene caricato su nessun server.
-Gratuito, senza account, senza installare programmi.
+- **`FRAMES.zip`**: the frames, in order, with a CSV index of exact timestamps. A "smart" mode saves one image per slide, formula or whiteboard state and ignores the cursor and the presenter's webcam.
+- **`TRASCRIZIONE.txt`**: a full transcript made with OpenAI Whisper running locally on the GPU (WebGPU), plus optional `.srt` subtitles.
+- **`VIDEO_COMPRESSO.mp4`** (optional): H.264 compressed to a target size, with the same FPS, resolution and untouched audio.
 
-## Come usarla
+Nothing is uploaded: the video never leaves the computer. There is no server, no account and nothing to install.
 
-### A. File unico (il modo più semplice)
+![Screenshot: a queue of three lectures ready to be processed](docs/screenshot.png)
 
-Apri `VideoFrameStudio.html` con doppio clic in Chrome o Edge. Funziona da disco, senza server.
+> The interface is in Italian: it was built for Italian university students.
 
-### B. Pubblicata su un sito gratuito (consigliato per l'uso continuativo)
+## Try it
 
-La cartella `dist/` è un sito statico: basta caricarla su un hosting gratuito con HTTPS, per esempio:
+- **Online:** https://giovannibishara.github.io/VideoFrameStudio/ (Chrome or Edge on desktop)
+- **Offline, single file:** download [`VideoFrameStudio.html`](https://giovannibishara.github.io/VideoFrameStudio/VideoFrameStudio.html) and open it with a double click. When opened from disk, the app asks for a folder and saves the results there as they are produced.
 
-- **Netlify Drop**: vai su https://app.netlify.com/drop e trascina la cartella `dist` nella pagina.
-- **Cloudflare Pages** o **GitHub Pages**: carica il contenuto di `dist/` come sito statico.
+The first transcription downloads the Whisper model once (about 1.4 GB for "Alta precisione", about 300 MB for "Veloce"). After that the model stays in the browser cache.
 
-Con un indirizzo `https://` il browser conserva in modo affidabile la cache del modello Whisper
-(scaricato una sola volta) e l'archivio dei risultati.
+## Highlights
 
-Al primo uso della trascrizione servono internet e circa 1,4 GB di download (modello "Alta precisione")
-o circa 300 MB (modello "Veloce"); dalle volte successive il modello è nella cache del browser.
+**Built for multi-hour, multi-gigabyte files**
+- The video is read in chunks through Mediabunny's `BlobSource`, so it is never loaded fully into RAM.
+- Decoded audio is held in a bounded buffer: at most 10 minutes ahead (about 38 MB).
+- Results are streamed to disk through the Origin Private File System or a user-chosen folder (File System Access API).
+- The ZIP writer is custom and supports ZIP64, so archives can exceed 4 GB and hold more than 65,535 files. It is tested against Python's `zipfile` and `unzip`.
 
-## Come funziona
+**Transcription that does not silently lose speech**
+- **Seek-based windowing, as in OpenAI's reference implementation.** A sentence cut at the end of a 30 s window is re-read from its start in the next window, so sentences are never split or duplicated.
+- **Two decoding rules from the original Whisper, re-implemented as custom logits processors.** Transformers.js 4.3.2 does not enforce them:
+  - the first timestamp of a window must fall within 1 s;
+  - timestamps must never go backwards.
+- **Temperature fallback (0 → 0.2 → 0.4).** A window is redone when the text repeats itself (gzip compression ratio > 2.4), echoes the prompt, or has low average log-probability (< −1).
+- **Second pass on skipped speech.** Spans with clear speech energy but no text are re-transcribed on their own and merged back in place, with exact timestamps.
+- **Nothing is hidden.**
+  - Audio that cannot be transcribed is marked `[PARTE NON TRASCRITTA …]` and the file is named `TRASCRIZIONE_INCOMPLETA.txt`.
+  - Uncertain windows are flagged in the preview and counted in the summary.
+- **Domain vocabulary.** A course and terminology field is passed to Whisper as its native initial prompt (`<|startofprev|>`), so technical terms are spelled correctly.
 
-| Parte | Tecnologia |
+**Performance without trading accuracy**
+- Frames, transcription and compression run in separate Web Workers. JPEG/PNG encoding is spread over several cores with `OffscreenCanvas`.
+- Video decoding (WebCodecs) and Whisper (WebGPU) run in parallel, because they use different parts of the GPU.
+- When a window is retried, the Whisper encoder output is computed once and reused. This saves the heaviest part of a retry and produces the same text.
+- In a queue, the loaded model is kept between videos.
+- The log reports where time goes: first pass, retries, second pass, waiting for audio, encoder vs. token generation, and real-time speed every 10 minutes.
+
+**Smart frame extraction**
+- Each frame is reduced to a 320×180 grayscale thumbnail split into 10×10 blocks. A frame is saved when enough blocks change and the content has settled.
+- A moving cursor touches too few blocks to trigger a save.
+- Regions that change all the time, such as a Webex webcam or an embedded video, are detected and excluded.
+- Before each change, the final state is saved too, for example a full whiteboard just before it is erased.
+
+**Queue of videos.** Drop a whole course at once. Videos are processed one at a time and each gets its own sub-folder. While the tab is visible, a Wake Lock keeps the PC from sleeping.
+
+## Architecture
+
+```
+src/
+├── main.tsx                  React UI: queue, options, progress, downloads
+├── app/system.ts             capability checks (WebCodecs, WebGPU, OPFS), probing, downloads, wake lock
+├── workerUrls.ts             workers as module files (site) or inlined blobs (single-file build)
+├── workers/
+│   ├── frames.worker.ts      decode → select frames → encode in parallel → streaming ZIP
+│   ├── encoder.worker.ts     JPEG/PNG encoding with OffscreenCanvas
+│   ├── transcribe.worker.ts  audio decode → 16 kHz mono → Whisper (Transformers.js, WebGPU/WASM)
+│   └── compress.worker.ts    H.264 re-encode to a target size (Mediabunny Conversion)
+└── shared/
+    ├── transcribeCore.ts     model-independent windowing, retries, second pass, gap accounting
+    ├── whisperRules.ts       timestamp rules and log-probability tracking (logits processors)
+    ├── smart.ts              slide/whiteboard change detection
+    ├── zip.ts                streaming ZIP/ZIP64 writer with CRC-32
+    ├── resample.ts           streaming anti-aliased resampler
+    ├── transcriptText.ts     paragraphs, timestamps, SRT
+    └── outfile.ts            OPFS / folder / in-memory output files
+```
+
+| Concern | Technology |
 |---|---|
-| Lettura del video (MP4, MOV, MKV, WebM) a blocchi, senza caricarlo in RAM | Mediabunny 1.65 (`BlobSource`) |
-| Decodifica video, con accelerazione hardware quando il browser la offre | WebCodecs tramite `VideoSampleSink` |
-| Codifica JPG/PNG su più core in parallelo | Web Worker + `OffscreenCanvas.convertToBlob` |
-| ZIP in streaming (ZIP64 oltre 4 GB / 65.535 file), file già compressi salvati senza ricompressione | scrittore ZIP interno (`src/shared/zip.ts`), testato con Python `zipfile` e `unzip` |
-| Scrittura progressiva su disco | Origin Private File System (`FileSystemSyncAccessHandle`) o cartella scelta (File System Access API) |
-| Audio → 16 kHz mono con filtro anti-aliasing, a blocchi (max 10 min in memoria) | `src/shared/resample.ts` |
-| Riconoscimento vocale | Transformers.js 4.3.2 + Whisper multilingue (`onnx-community/whisper-large-v3-turbo` o `whisper-small`), WebGPU, ripiego WebAssembly |
-| Compressione | Mediabunny `Conversion` → H.264 MP4, `hardwareAcceleration: 'prefer-hardware'` |
+| Container parsing and decoding (MP4, MOV, MKV, WebM) | [Mediabunny](https://mediabunny.dev) 1.65 on top of WebCodecs |
+| Speech recognition | [Transformers.js](https://github.com/huggingface/transformers.js) 4.3.2 with `whisper-large-v3-turbo` or `whisper-small` (ONNX), WebGPU with WebAssembly fallback |
+| UI | React 19, plain CSS, light and dark themes |
+| Build | esbuild: a static site plus a single self-contained HTML file with inlined workers |
 
-### Trascrizione lunga, senza buchi né doppioni
-
-Whisper lavora su finestre da 30 s. L'app usa l'algoritmo "a seek" di Whisper: se l'ultima frase di una
-finestra è tagliata, la finestra successiva riparte dall'inizio di quella frase (sovrapposizione), quindi
-nessuna frase viene spezzata o ripetuta. Ogni secondo di audio finisce nel testo, in una zona di silenzio
-riconosciuta (nessun tratto di almeno 200 ms sopra -50 dBFS), oppure, se il modello fallisce 4 volte, in un
-segnaposto esplicito `[PARTE NON TRASCRITTA …]`: in quel caso il file si chiama `TRASCRIZIONE_INCOMPLETA.txt`.
-
-Controlli di qualità come nell'implementazione originale di Whisper: rapporto di compressione del testo
-(> 2,4 = ripetizioni anomale → nuovo tentativo con `no_repeat_ngram_size`), frasi tipiche che il modello
-inventa sul silenzio scartate solo se l'audio in quel punto è davvero silenzioso.
-
-Il campo "Corso e termini tecnici" diventa il prompt iniziale di Whisper (`<|startofprev|>`), una funzione
-nativa del modello. Il rilevamento automatico della lingua usa il token di lingua predetto da Whisper.
-
-### Estrazione intelligente
-
-Miniature 320×180 in scala di grigi divise in blocchi 10×10. Un frame viene salvato quando cambia una quota
-di blocchi superiore alla soglia (sensibilità regolabile) e il contenuto si è stabilizzato; il cursore tocca
-pochi blocchi e non basta. Le zone che cambiano di continuo (webcam del docente in Webex, video incorporati)
-vengono riconosciute ed escluse. Prima di un cambio viene salvato anche lo stato finale (es. lavagna piena
-prima di essere cancellata).
-
-## Sviluppo
+## Development
 
 ```bash
 npm install
 npm run dev            # http://localhost:5173
-npm run build          # dist/
+npm run typecheck
+npm test               # unit tests (Node)
+npm run build          # dist/: static site
 npm run build:single   # dist-single/VideoFrameStudio.html
 ```
 
-Test (richiedono Python 3 con Pillow, ffmpeg, Chrome e Playwright):
+### Tests
+
+The unit tests cover:
+- ZIP/ZIP64 output, checked with Python's `zipfile` and `unzip`;
+- the resampler;
+- slide and whiteboard detection;
+- transcript formatting;
+- the transcription pipeline.
+
+Testing the transcription pipeline does not need the real model. A simulated recognizer "hears" synthetic tones as numbered sentences, which makes completeness, order and timestamps checkable exactly. On a 40-minute synthetic lecture with a 2-minute pause, every sentence appears once, in order, with timestamps within 60 ms. Further tests force the model to fail in specific ways and check how the pipeline reacts:
+
+| Simulated failure | What the tests check |
+|---|---|
+| Wrong, low-confidence text at temperature 0 | The window is retried at 0.2 and the confident text is kept |
+| Low confidence on every attempt | The text is kept and flagged for review, never dropped |
+| One sentence skipped per window | Every skipped sentence is recovered by the second pass, with exact timestamps |
+| The model fails 4 times on one window | The gap is declared in the text and the transcript is marked incomplete |
+
+The end-to-end tests run in headless Chrome with Playwright. They load generated videos whose frames carry their own number, run the real UI and verify every output file. They need Python 3 with Pillow, ffmpeg, Chrome and Playwright:
 
 ```bash
-npx esbuild tests/unit.test.ts --bundle --platform=node --format=esm --outfile=unit.mjs && node unit.mjs
-python3 tests/make_test_videos.py ./video-prova 20
+python3 tests/make_test_videos.py ./test-videos 20
 npm run build:test && (cd dist-test && python3 -m http.server 8123) &
-node tests/browser.test.mjs "http://127.0.0.1:8123/?test-asr" video-prova/breve.mp4 out all
-python3 tests/verify.py video-prova/breve.mp4 out all 5
+node tests/browser.test.mjs "http://127.0.0.1:8123/?test-asr" test-videos/breve.mp4 out all
+python3 tests/verify.py test-videos/breve.mp4 out all 5
 ```
 
-La build di test contiene un motore di riconoscimento simulato (toni → "frase N") che permette di verificare
-in automatico completezza, ordine e timestamp della trascrizione; la build pubblicata lo esclude (il build
-fallisce se ci finisse dentro).
+The test build contains the simulated recognizer. The build fails if that code ever ends up in a published bundle.
 
-## Limiti noti
+## Known limits
 
-- La velocità di Whisper dipende dalla GPU: senza WebGPU (o con WebGPU solo emulato) la trascrizione gira
-  su CPU ed è molto più lenta.
-- La dimensione finale della compressione dipende dal codificatore hardware: se supera l'obiettivo l'app lo
-  dichiara e, se attivato, ripete una volta con bitrate corretto.
-- Con il file unico aperto da disco alcune versioni del browser potrebbero non conservare la cache del
-  modello tra una sessione e l'altra; con la versione pubblicata su `https://` la cache è stabile.
+- Whisper speed depends on the GPU. Without WebGPU, transcription runs on the CPU and is much slower.
+- Integrated GPUs work, but a discrete GPU is many times faster.
+- The size of the compressed video depends on the hardware encoder. If the encoder overshoots the target, the app says so and can retry once with a corrected bitrate.
+
+## License
+
+MIT © Giovanni Bishara. Mediabunny is MPL-2.0. The Whisper models are released by OpenAI under the MIT license.

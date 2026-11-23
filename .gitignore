@@ -1,0 +1,10 @@
+node_modules/
+dist/
+dist-single/
+dist-test/
+.test/
+out/
+test-videos/
+video-prova/
+*.log
+.DS_Store
