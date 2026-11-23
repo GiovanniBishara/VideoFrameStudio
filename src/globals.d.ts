@@ -7,3 +7,6 @@ interface FileSystemSyncAccessHandle {
 	flush(): void;
 	close(): void;
 }
+
+// Fogli di stile importati per effetto collaterale (li raccoglie esbuild).
+declare module '*.css';
