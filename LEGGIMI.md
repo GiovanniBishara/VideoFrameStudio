@@ -1,12 +1,14 @@
 # VideoFrame & Transcript Studio
 
+*Guida in italiano. [English README](README.md).*
+
 Web app che, per ogni video caricato (anche oltre 1 GB, anche più video insieme in coda), produce:
 
 - **FRAMES.zip** – fotogrammi in ordine cronologico, con `frames_index.csv`
 - **TRASCRIZIONE.txt** – trascrizione completa con Whisper (opzionale `SOTTOTITOLI.srt`)
 - **VIDEO_COMPRESSO.mp4** – solo se richiesto, H.264 verso una dimensione obiettivo
 
-Tutto avviene nel browser (Chrome o Edge su Windows 11): il video non viene caricato su nessun server.
+Tutto avviene nel browser (Chrome o Edge): il video non viene caricato su nessun server.
 Gratuito, senza account, senza installare programmi.
 
 ## Più video in coda
@@ -18,19 +20,23 @@ l'altro e, finché la scheda è in primo piano, il PC non va in standby.
 
 ## Come usarla
 
-### A. File unico (il modo più semplice)
+### A. Online (il modo più semplice)
 
-Apri `VideoFrameStudio.html` con doppio clic in Chrome o Edge. Funziona da disco, senza server.
+Apri https://giovannibishara.github.io/VideoFrameStudio/ con Chrome o Edge. Con un indirizzo `https://` il
+browser conserva in modo affidabile la cache del modello Whisper (scaricato una sola volta) e l'archivio dei
+risultati.
 
-### B. Pubblicata su un sito gratuito (consigliato per l'uso continuativo)
+### B. File unico, anche senza internet per frame e compressione
 
-La cartella `dist/` è un sito statico: basta caricarla su un hosting gratuito con HTTPS, per esempio:
+Scarica `VideoFrameStudio.html` dall'[ultima release](https://github.com/GiovanniBishara/VideoFrameStudio/releases/latest)
+e aprilo con doppio clic in Chrome o Edge. Aperto da disco, il browser non concede il suo archivio interno:
+l'app chiede una cartella del PC e scrive lì i risultati man mano. Il file `SHA256SUMS.txt` della release
+permette di verificare il download (`Get-FileHash VideoFrameStudio.html` in PowerShell).
 
-- **Netlify Drop**: vai su https://app.netlify.com/drop e trascina la cartella `dist` nella pagina.
-- **Cloudflare Pages** o **GitHub Pages**: carica il contenuto di `dist/` come sito statico.
+### C. Sul tuo sito
 
-Con un indirizzo `https://` il browser conserva in modo affidabile la cache del modello Whisper
-(scaricato una sola volta) e l'archivio dei risultati.
+`VideoFrameStudio-sito.zip` (nella release) è il sito statico: si pubblica così com'è su qualsiasi hosting con
+HTTPS (Netlify Drop, Cloudflare Pages, GitHub Pages).
 
 Al primo uso della trascrizione servono internet e circa 1,4 GB di download (modello "Alta precisione")
 o circa 300 MB (modello "Veloce"); dalle volte successive il modello è nella cache del browser.

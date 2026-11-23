@@ -27,5 +27,20 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/GiovanniBishara/VideoFrameStudio.git"
-  }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "homepage": "https://giovannibishara.github.io/VideoFrameStudio/",
+  "keywords": [
+    "whisper",
+    "transcription",
+    "webgpu",
+    "webcodecs",
+    "lecture",
+    "frame-extraction",
+    "transformers-js",
+    "react",
+    "typescript"
+  ]
 }

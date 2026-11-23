@@ -1,4 +1,4 @@
-name: CI e pubblicazione
+name: CI
 
 on:
   push:
@@ -6,49 +6,64 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only token by default: only the Pages job below can publish.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: 22
-      - run: npm install --no-audit --no-fund
-      - name: Controllo dei tipi
+      - name: Install
+        run: npm install --no-audit --no-fund
+      - name: Type check
         run: npm run typecheck
-      - name: Test unitari
+      - name: Unit tests
         run: npm test
-      - name: Build del sito
+      - name: Build the site
         run: npm run build
-      - name: Build del file unico
+      - name: Build the single file
         run: npm run build:single
-      - name: File unico scaricabile anche dal sito
+      - name: Single file also downloadable from the site
         run: cp dist-single/VideoFrameStudio.html dist/VideoFrameStudio.html
-      - uses: actions/upload-artifact@v4
-        with:
-          name: VideoFrameStudio-html
-          path: dist-single/VideoFrameStudio.html
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5.0.0
         with:
           path: dist
 
-  deploy:
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
-    needs: build
+  audit:
+    # Known vulnerabilities in the libraries shipped to the browser fail the build.
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm audit --omit=dev --audit-level=high
+
+  pages:
+    # Publishes https://giovannibishara.github.io/VideoFrameStudio/ from main.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: [test, audit]
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346  # v5.0.1
