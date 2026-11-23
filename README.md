@@ -172,7 +172,7 @@ npm run build          # dist/: static site
 npm run build:single   # dist-single/VideoFrameStudio.html
 ```
 
-On every push, CI runs the type check, the tests, both builds and an `npm audit`, then publishes the site to GitHub Pages. Pushing a version tag (`v1.2.0`) creates a release with the single file, the site as a ZIP, and their checksums. Dependabot proposes dependency and Action updates every week, and Actions are pinned to exact commits.
+On every push, CI runs the type check, the tests, both builds and an `npm audit`, then publishes the site to GitHub Pages. A new version number in `package.json` publishes a release, with its tag, containing the single file, the site as a ZIP, and their checksums. Dependabot proposes dependency and Action updates every week, and Actions are pinned to exact commits.
 
 ## Privacy
 

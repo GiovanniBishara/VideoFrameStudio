@@ -1,16 +1,40 @@
 name: Release
 
-# Push a version tag (git tag v1.2.0 && git push origin v1.2.0): this workflow
-# runs the tests, builds the app and publishes a GitHub release with the files.
+# A new version in package.json on main publishes a release: this workflow checks
+# that the release v<version> does not exist yet, runs the tests, builds the app and
+# creates the release (and its tag) with the files and their checksums.
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths: [package.json, .github/workflows/release.yml]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      exists: ${{ steps.version.outputs.exists }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          tag="v$(node -p "require('./package.json').version")"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$REPO" >/dev/null 2>&1; then echo "exists=true" >> "$GITHUB_OUTPUT"; else echo "exists=false" >> "$GITHUB_OUTPUT"; fi
+          echo "$tag"
+
   build:
+    needs: check
+    if: needs.check.outputs.exists != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -38,7 +62,7 @@ jobs:
           path: release
 
   publish:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write  # only this job, only to create the release
@@ -50,15 +74,11 @@ jobs:
         with:
           name: release
           path: release
-      - name: Create the release (or update its files)
+      - name: Create the release and its tag
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.check.outputs.tag }}
           REPO: ${{ github.repository }}
-        run: |
-          files="release/VideoFrameStudio.html release/VideoFrameStudio-sito.zip release/SHA256SUMS.txt"
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" $files --clobber --repo "$REPO"
-          else
-            gh release create "$TAG" $files --repo "$REPO" --title "VideoFrame & Transcript Studio ${TAG#v}" --notes-file docs/release-notes.md
-          fi
+        run: >
+          gh release create "$TAG" release/VideoFrameStudio.html release/VideoFrameStudio-sito.zip release/SHA256SUMS.txt
+          --repo "$REPO" --target "$GITHUB_SHA" --title "VideoFrame & Transcript Studio ${TAG#v}" --notes-file docs/release-notes.md

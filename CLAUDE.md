@@ -48,3 +48,11 @@ Le parti non trascritte non si nascondono mai. Finiscono nel testo come `[PARTE 
   Ognuna ha un controllo che la spegne da sola se non funziona, con un avviso nel registro. Se si aggiorna la libreria, riverificarle tutte e tre.
 - Il motore finto (`src/test/fakeEngine.ts`) deve restare solo nella build di test. `build.mjs` fallisce se finisce nella build pubblicata.
 - Nel file unico aperto da disco (origine `null`) i worker sono classici, creati da URL blob: Chrome non accetta worker-modulo in quel caso.
+
+## Rilasci
+
+Per pubblicare una versione basta cambiare `version` in `package.json` (e aggiornare `CHANGELOG.md` e `docs/release-notes.md`) con un commit su `main`. Il workflow `release.yml` fa il resto:
+- esegue i controlli dei tipi e i test;
+- costruisce il file unico e il sito;
+- calcola i checksum;
+- crea la release `v<versione>` con il suo tag.
