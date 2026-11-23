@@ -1,15 +1,16 @@
 {
   "name": "videoframe-transcript-studio",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "Estrazione frame, trascrizione Whisper e compressione video direttamente nel browser (WebCodecs, WebGPU, Web Workers).",
+  "description": "Frame extraction, Whisper transcription and video compression for long lecture recordings, entirely in the browser (WebCodecs, WebGPU, Web Workers).",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
     "build:single": "node build.mjs --single",
     "build:test": "node build.mjs --test",
     "dev": "node build.mjs --serve",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "esbuild tests/unit.test.ts --bundle --platform=node --format=esm --outfile=.test/unit.mjs --log-level=warning && node .test/unit.mjs"
   },
   "dependencies": {
     "mediabunny": "1.65.0",
@@ -21,5 +22,25 @@
     "@types/react-dom": "^19.2.0",
     "esbuild": "^0.28.2",
     "typescript": "^6.0.3"
-  }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GiovanniBishara/VideoFrameStudio.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "homepage": "https://giovannibishara.github.io/VideoFrameStudio/",
+  "keywords": [
+    "whisper",
+    "transcription",
+    "webgpu",
+    "webcodecs",
+    "lecture",
+    "frame-extraction",
+    "transformers-js",
+    "react",
+    "typescript"
+  ]
 }
