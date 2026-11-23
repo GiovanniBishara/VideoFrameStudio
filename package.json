@@ -13,15 +13,15 @@
     "test": "esbuild tests/unit.test.ts --bundle --platform=node --format=esm --outfile=.test/unit.mjs --log-level=warning && node .test/unit.mjs"
   },
   "dependencies": {
-    "mediabunny": "1.65.0",
-    "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "mediabunny": "1.66.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
   },
   "devDependencies": {
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "esbuild": "^0.28.2",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   },
   "license": "MIT",
   "repository": {
